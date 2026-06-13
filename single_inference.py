@@ -162,7 +162,27 @@ class CustomCosyVoiceFrontEnd(CosyVoiceFrontEnd):
         }
         model_input.update(prompt_cache)
         return model_input
-    
+
+    def frontend_cached(self, tts_text, spk_id):
+        # Build model input for a speaker previously registered into spk2info
+        # (see CustomCosyVoice.add_spk), reusing the precomputed prompt tensors.
+        tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
+        spk_info = self.spk2info[spk_id]
+        model_input = {
+            'text': tts_text_token, 'text_len': tts_text_token_len,
+            'prompt_text': spk_info['prompt_text_token'],
+            'prompt_text_len': spk_info['prompt_text_token_len'],
+            'llm_prompt_speech_token': spk_info['speech_token'],
+            'llm_prompt_speech_token_len': spk_info['speech_token_len'],
+            'flow_prompt_speech_token': spk_info['speech_token'],
+            'flow_prompt_speech_token_len': spk_info['speech_token_len'],
+            'prompt_speech_feat': spk_info['speech_feat'],
+            'prompt_speech_feat_len': spk_info['speech_feat_len'],
+            'llm_embedding': spk_info['embedding'],
+            'flow_embedding': spk_info['embedding'],
+        }
+        return model_input
+
     def frontend_zero_shot_dual(self, tts_text, prompt_text, prompt_speech_16k, flow_prompt_text, flow_prompt_speech_16k):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
         prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
@@ -273,7 +293,8 @@ class CustomCosyVoice:
             model_dir = snapshot_download(model_dir)
         print("model", model_dir)
         self.model_dir = model_dir
-        
+        self.device = get_torch_device(torch)
+
         with open('{}/cosyvoice.yaml'.format(model_dir), 'r') as f:
             configs = load_hyperpyyaml(f)
         self.frontend = CustomCosyVoiceFrontEnd(configs['get_tokenizer'],
@@ -293,6 +314,35 @@ class CustomCosyVoice:
     def list_avaliable_spks(self):
         spks = list(self.frontend.spk2info.keys())
         return spks
+
+    def cal_spk_info(self, audio_path, prompt_text):
+        # Precompute the prompt tensors for a speaker so they can be cached in
+        # spk2info and reused across requests without re-running the frontend.
+        prompt_speech_16k = load_wav(audio_path, 16000)
+        ret = {}
+        ret['prompt_text_token'], ret['prompt_text_token_len'] = self.frontend._extract_text_token(prompt_text)
+        prompt_speech_22050 = torchaudio.transforms.Resample(orig_freq=16000, new_freq=22050)(prompt_speech_16k)
+        ret['speech_feat'], ret['speech_feat_len'] = self.frontend._extract_speech_feat(prompt_speech_22050)
+        ret['speech_token'], ret['speech_token_len'] = self.frontend._extract_speech_token(prompt_speech_16k)
+        ret['embedding'] = self.frontend._extract_spk_embedding(prompt_speech_16k)
+        return ret
+
+    def add_spk(self, spk_id, spk_info):
+        # Register/overwrite a speaker and persist the spk2info registry.
+        model_name = f"{self.model_dir}/spk2info.pt"
+        self.frontend.spk2info[spk_id] = spk_info
+        torch.save(self.frontend.spk2info, model_name)
+        print(self.frontend.spk2info.keys())
+        print(f"新增Speaker成功，儲存為 {spk_id}")
+
+    def remove_spk(self, spk_id):
+        # Remove a speaker from the registry and persist the change.
+        model_name = f"{self.model_dir}/spk2info.pt"
+        if spk_id in self.frontend.spk2info:
+            del self.frontend.spk2info[spk_id]
+        torch.save(self.frontend.spk2info, model_name)
+        print(self.frontend.spk2info.keys())
+        print(f"刪除Speaker成功: {spk_id}")
 
     def build_zero_shot_prompt_cache(self, prompt_text, prompt_speech_16k):
         return self.frontend.build_zero_shot_prompt_cache(prompt_text, prompt_speech_16k)
@@ -354,7 +404,18 @@ class CustomCosyVoice:
             model_output = self.model.inference(**model_input)
             tts_speeches.append(model_output['tts_speech'])
         return {'tts_speech': torch.concat(tts_speeches, dim=1)}
-        
+
+    def inference_cached(self, tts_text, spk_id):
+        tts_speeches = []
+        for i in re.split(r'(?<=[？！。.?!])\s*', tts_text):
+            if not len(i):
+                continue
+            print("Synthesizing:", i)
+            model_input = self.frontend.frontend_cached(i, spk_id)
+            model_output = self.model.inference(**model_input)
+            tts_speeches.append(model_output['tts_speech'])
+        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
+
 ####wav2text
 def transcribe_audio(audio_file):
     #model = whisper.load_model("base")
@@ -489,6 +550,66 @@ def main():
     content_to_synthesize = args.content_to_synthesize
     output_path = args.output_path.strip()
     single_inference(speaker_prompt_audio_path, content_to_synthesize, output_path, cosyvoice, bopomofo_converter, args.speaker_prompt_text_transcription)
+
+def inference_cached(content_to_synthesize, output_path, cosyvoice, bopomofo_converter, spk_id):
+    output_path = output_path.strip()
+
+    ###normalization
+    content_to_synthesize = cosyvoice.frontend.text_normalize_new(
+        content_to_synthesize,
+        split=False
+    )
+    content_to_synthesize_bopomo = get_bopomofo_rare(content_to_synthesize, bopomofo_converter)
+    print("Content to be synthesized:", content_to_synthesize_bopomo)
+    start = time.time()
+    output = cosyvoice.inference_cached(content_to_synthesize_bopomo, spk_id)
+    end = time.time()
+    print("Elapsed time:", end - start)
+    print("Generated audio length:", output['tts_speech'].shape[1] / 22050, "seconds")
+    torchaudio.save(output_path, output['tts_speech'], 22050)
+    print(f"Generated voice saved to {output_path}")
+
+def main_cached():
+    ####args
+    parser = argparse.ArgumentParser(description="Synthesize speech from a speaker previously registered with add_spk")
+    parser.add_argument("--content_to_synthesize", type=str, required=True, help="Specifies the content that will be synthesized into speech.")
+    parser.add_argument("--output_path", type=str, required=False, default="results/output.wav", help="Specifies the name and path for the output .wav file.")
+    parser.add_argument("--model_path", type=str, required=False, default="MediaTek-Research/BreezyVoice-300M", help="Specifies the model used for speech synthesis.")
+    parser.add_argument("--spk_id", type=str, required=False, default="test_human", help="The id of a speaker previously registered with add_spk.")
+    args = parser.parse_args()
+
+    cosyvoice = CustomCosyVoice(args.model_path)
+    bopomofo_converter = G2PWConverter()
+
+    inference_cached(args.content_to_synthesize, args.output_path.strip(), cosyvoice, bopomofo_converter, args.spk_id)
+
+def add_spk():
+    ####args
+    parser = argparse.ArgumentParser(description="Register a speaker's cached weights into spk2info for fast cached inference")
+    parser.add_argument("--speaker_prompt_audio_path", type=str, required=True, help="Specifies the path to the prompt speech audio file of the speaker.")
+    parser.add_argument("--speaker_prompt_text_transcription", type=str, required=False, help="Specifies the transcription of the speaker prompt audio (Highly Recommended, if not provided, the system will fall back to transcribing with Whisper.)")
+    parser.add_argument("--model_path", type=str, required=False, default="MediaTek-Research/BreezyVoice-300M", help="Specifies the model used for speech synthesis.")
+    parser.add_argument("--spk_id", type=str, required=False, default="test_human", help="The id to register this speaker under.")
+    args = parser.parse_args()
+
+    speaker_prompt_audio_path = args.speaker_prompt_audio_path
+    if args.speaker_prompt_text_transcription:
+        speaker_prompt_text_transcription = args.speaker_prompt_text_transcription
+    else:
+        speaker_prompt_text_transcription = transcribe_audio(speaker_prompt_audio_path)
+
+    cosyvoice = CustomCosyVoice(args.model_path)
+    spk_info = cosyvoice.cal_spk_info(speaker_prompt_audio_path, speaker_prompt_text_transcription)
+    cosyvoice.add_spk(args.spk_id, spk_info)
+
+def remove_spk():
+    ####args
+    parser = argparse.ArgumentParser(description="Remove a previously registered speaker from spk2info")
+    parser.add_argument("--model_path", type=str, required=False, default="MediaTek-Research/BreezyVoice-300M", help="Specifies the model whose spk2info registry to edit.")
+    parser.add_argument("--spk_id", type=str, required=False, default="test_human", help="The id of the speaker to remove.")
+    args = parser.parse_args()
+    cosyvoice = CustomCosyVoice(args.model_path)
+    cosyvoice.remove_spk(args.spk_id)
 
 if __name__ == "__main__":
     main()
