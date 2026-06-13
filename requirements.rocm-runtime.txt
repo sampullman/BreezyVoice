@@ -1,0 +1,4 @@
+# Keep ROCm-specific overrides separate from the generic runtime dependency list.
+numpy<2
+ruamel.yaml<0.18
+setuptools<81

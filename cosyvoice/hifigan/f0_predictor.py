@@ -13,6 +13,7 @@
 # limitations under the License.
 import torch
 import torch.nn as nn
+from torch.nn.utils import remove_weight_norm
 from torch.nn.utils import weight_norm
 
 
@@ -53,3 +54,8 @@ class ConvRNNF0Predictor(nn.Module):
         x = self.condnet(x)
         x = x.transpose(1, 2)
         return torch.abs(self.classifier(x).squeeze(-1))
+
+    def remove_weight_norm(self):
+        for layer in self.condnet:
+            if isinstance(layer, nn.Conv1d):
+                remove_weight_norm(layer)

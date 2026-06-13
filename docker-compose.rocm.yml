@@ -1,0 +1,61 @@
+services:
+  app:
+    image: breezyvoice:rocm
+    build:
+      context: .
+      dockerfile: Dockerfile.rocm
+      args:
+        ROCM_PYTORCH_IMAGE: ${ROCM_PYTORCH_IMAGE:-rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1}
+    working_dir: /workspace/BreezyVoice
+    ports:
+      - "8080:8080"
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host
+    shm_size: 8gb
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    environment:
+      MODEL_PATH: ${MODEL_PATH:-MediaTek-Research/BreezyVoice}
+      BREEZYVOICE_DEVICE: ${BREEZYVOICE_DEVICE:-rocm}
+      BREEZYVOICE_ORT_DEVICE: ${BREEZYVOICE_ORT_DEVICE:-cpu}
+      BREEZYVOICE_USE_TTSFRD: ${BREEZYVOICE_USE_TTSFRD:-0}
+      BREEZYVOICE_NUM_THREADS: ${BREEZYVOICE_NUM_THREADS:-16}
+      BREEZYVOICE_ORT_INTRA_OP_THREADS: ${BREEZYVOICE_ORT_INTRA_OP_THREADS:-8}
+      BREEZYVOICE_ORT_INTER_OP_THREADS: ${BREEZYVOICE_ORT_INTER_OP_THREADS:-1}
+      BREEZYVOICE_TORCH_BENCHMARK: ${BREEZYVOICE_TORCH_BENCHMARK:-1}
+      BREEZYVOICE_TORCH_DETERMINISTIC: ${BREEZYVOICE_TORCH_DETERMINISTIC:-0}
+      BREEZYVOICE_FLOAT32_MATMUL_PRECISION: ${BREEZYVOICE_FLOAT32_MATMUL_PRECISION:-high}
+      BREEZYVOICE_FLOW_AMP: ${BREEZYVOICE_FLOW_AMP:-}
+      BREEZYVOICE_HIFT_AMP: ${BREEZYVOICE_HIFT_AMP:-}
+      BREEZYVOICE_EMPTY_CACHE: ${BREEZYVOICE_EMPTY_CACHE:-0}
+      BREEZYVOICE_LOG_STAGE_TIMINGS: ${BREEZYVOICE_LOG_STAGE_TIMINGS:-1}
+      BREEZYVOICE_WARMUP: ${BREEZYVOICE_WARMUP:-1}
+      BREEZYVOICE_WARMUP_TEXT: ${BREEZYVOICE_WARMUP_TEXT:-你好。}
+      TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL: ${TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL:-1}
+      ROCBLAS_USE_HIPBLASLT: ${ROCBLAS_USE_HIPBLASLT:-0}
+      MIOPEN_FIND_ENFORCE: ${MIOPEN_FIND_ENFORCE:-SEARCH}
+      MIOPEN_GEMM_ENFORCE_BACKEND: ${MIOPEN_GEMM_ENFORCE_BACKEND:-1}
+      MIOPEN_CUSTOM_CACHE_DIR: /root/.cache/miopen
+      MIOPEN_USER_DB_PATH: /root/.config/miopen
+      HF_HOME: /root/.cache/huggingface
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/workspace/BreezyVoice
+      - hf-cache:/root/.cache/huggingface
+      - miopen-cache:/root/.cache/miopen
+      - miopen-db:/root/.config/miopen
+    command: ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
+    init: true
+
+volumes:
+  hf-cache:
+  miopen-cache:
+  miopen-db:

@@ -14,6 +14,10 @@
 # limitations under the License.
 
 import json
+from io import BytesIO
+
+import soundfile as sf
+import torch
 import torchaudio
 
 
@@ -33,7 +37,8 @@ def read_json_lists(list_file):
     return results
 
 def load_wav(wav, target_sr):
-    speech, sample_rate = torchaudio.load(wav)
+    speech_np, sample_rate = sf.read(wav, dtype='float32', always_2d=True)
+    speech = torch.from_numpy(speech_np).transpose(0, 1)
     speech = speech.mean(dim=0, keepdim=True)
     if sample_rate != target_sr:
         assert sample_rate > target_sr, 'wav sample rate {} must be greater than {}'.format(sample_rate, target_sr)

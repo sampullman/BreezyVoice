@@ -6,7 +6,6 @@ from functools import partial
 import time
 
 import torch
-torch.set_num_threads(1)
 import torchaudio
 import torchaudio.functional as F
 import whisper
@@ -19,8 +18,18 @@ from cosyvoice.cli.frontend import CosyVoiceFrontEnd
 from cosyvoice.cli.model import CosyVoiceModel
 from cosyvoice.cli.cosyvoice import CosyVoice
 from cosyvoice.utils.file_utils import load_wav
+from cosyvoice.utils.runtime import (
+    build_stage_autocast,
+    clear_device_cache,
+    configure_torch_runtime,
+    get_amp_dtype_name,
+    get_torch_device,
+    should_log_stage_timings,
+)
 from cosyvoice.utils.frontend_utils import (contains_chinese, replace_blank, replace_corner_mark,remove_bracket, spell_out_number, split_paragraph)
 from utils.word_utils import word_to_dataset_frequency, char2phn, always_augment_chars
+
+configure_torch_runtime(torch)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append('{}/third_party/Matcha-TTS'.format(ROOT_DIR))
@@ -123,6 +132,36 @@ class CustomCosyVoiceFrontEnd(CosyVoiceFrontEnd):
                        'prompt_speech_feat': speech_feat, 'prompt_speech_feat_len': speech_feat_len,
                        'llm_embedding': embedding, 'flow_embedding': embedding}
         return model_input
+
+    def build_zero_shot_prompt_cache(self, prompt_text, prompt_speech_16k):
+        prompt_text_token, prompt_text_token_len = self._extract_text_token(prompt_text)
+        prompt_speech_22050 = torchaudio.transforms.Resample(
+            orig_freq=16000, new_freq=22050
+        )(prompt_speech_16k)
+        speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_22050)
+        speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
+        embedding = self._extract_spk_embedding(prompt_speech_16k)
+        return {
+            "prompt_text": prompt_text_token,
+            "prompt_text_len": prompt_text_token_len,
+            "llm_prompt_speech_token": speech_token,
+            "llm_prompt_speech_token_len": speech_token_len,
+            "flow_prompt_speech_token": speech_token,
+            "flow_prompt_speech_token_len": speech_token_len,
+            "prompt_speech_feat": speech_feat,
+            "prompt_speech_feat_len": speech_feat_len,
+            "llm_embedding": embedding,
+            "flow_embedding": embedding,
+        }
+
+    def frontend_zero_shot_from_cache(self, tts_text, prompt_cache):
+        tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
+        model_input = {
+            "text": tts_text_token,
+            "text_len": tts_text_token_len,
+        }
+        model_input.update(prompt_cache)
+        return model_input
     
     def frontend_zero_shot_dual(self, tts_text, prompt_text, prompt_speech_16k, flow_prompt_text, flow_prompt_speech_16k):
         tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
@@ -153,10 +192,14 @@ class CustomCosyVoiceModel(CosyVoiceModel):
                  llm: torch.nn.Module,
                  flow: torch.nn.Module,
                  hift: torch.nn.Module):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        configure_torch_runtime(torch)
+        self.device = get_torch_device(torch)
         self.llm = llm
         self.flow = flow
         self.hift = hift
+        self.flow_amp_dtype = get_amp_dtype_name("flow")
+        self.hift_amp_dtype = get_amp_dtype_name("hift")
+        self.hift_weight_norm_removed = False
 
     def load(self, llm_model, flow_model, hift_model):
         self.llm.load_state_dict(torch.load(llm_model, map_location=self.device))
@@ -165,35 +208,58 @@ class CustomCosyVoiceModel(CosyVoiceModel):
         self.flow.to(self.device).eval()
         self.hift.load_state_dict(torch.load(hift_model, map_location=self.device))
         self.hift.to(self.device).eval()
+        if hasattr(self.hift, "remove_weight_norm"):
+            self.hift.remove_weight_norm()
+            self.hift_weight_norm_removed = True
 
     def inference(self, text, text_len, flow_embedding, llm_embedding=torch.zeros(0, 192),
                   prompt_text=torch.zeros(1, 0, dtype=torch.int32), prompt_text_len=torch.zeros(1, dtype=torch.int32),
                   llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32), llm_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
                   flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32), flow_prompt_speech_token_len=torch.zeros(1, dtype=torch.int32),
                   prompt_speech_feat=torch.zeros(1, 0, 80), prompt_speech_feat_len=torch.zeros(1, dtype=torch.int32)):
-        tts_speech_token = self.llm.inference(text=text.to(self.device),
-                                              text_len=text_len.to(self.device),
-                                              prompt_text=prompt_text.to(self.device),
-                                              prompt_text_len=prompt_text_len.to(self.device),
-                                              prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                              prompt_speech_token_len=llm_prompt_speech_token_len.to(self.device),
-                                              embedding=llm_embedding.to(self.device),
-                                              beam_size=1,
-                                              sampling=25,
-                                              max_token_text_ratio=30,
-                                              min_token_text_ratio=3)
-        
-        #input()
-
-        tts_mel = self.flow.inference(token=tts_speech_token,
-                                      token_len=torch.tensor([tts_speech_token.size(1)], dtype=torch.int32).to(self.device),
-                                      prompt_token=flow_prompt_speech_token.to(self.device),
-                                      prompt_token_len=flow_prompt_speech_token_len.to(self.device),
-                                      prompt_feat=prompt_speech_feat.to(self.device),
-                                      prompt_feat_len=prompt_speech_feat_len.to(self.device),
-                                      embedding=flow_embedding.to(self.device))
-        tts_speech = self.hift.inference(mel=tts_mel).cpu()
-        torch.cuda.empty_cache()
+        with torch.inference_mode():
+            llm_started = time.perf_counter()
+            tts_speech_token = self.llm.inference(text=text.to(self.device),
+                                                  text_len=text_len.to(self.device),
+                                                  prompt_text=prompt_text.to(self.device),
+                                                  prompt_text_len=prompt_text_len.to(self.device),
+                                                  prompt_speech_token=llm_prompt_speech_token.to(self.device),
+                                                  prompt_speech_token_len=llm_prompt_speech_token_len.to(self.device),
+                                                  embedding=llm_embedding.to(self.device),
+                                                  beam_size=1,
+                                                  sampling=25,
+                                                  max_token_text_ratio=30,
+                                                  min_token_text_ratio=3)
+            llm_seconds = time.perf_counter() - llm_started
+            flow_started = time.perf_counter()
+            with build_stage_autocast(torch, self.device, "flow"):
+                tts_mel = self.flow.inference(token=tts_speech_token,
+                                              token_len=torch.tensor([tts_speech_token.size(1)], dtype=torch.int32).to(self.device),
+                                              prompt_token=flow_prompt_speech_token.to(self.device),
+                                              prompt_token_len=flow_prompt_speech_token_len.to(self.device),
+                                              prompt_feat=prompt_speech_feat.to(self.device),
+                                              prompt_feat_len=prompt_speech_feat_len.to(self.device),
+                                              embedding=flow_embedding.to(self.device))
+            flow_seconds = time.perf_counter() - flow_started
+            hift_started = time.perf_counter()
+            with build_stage_autocast(torch, self.device, "hift"):
+                tts_speech = self.hift.inference(mel=tts_mel).cpu()
+            hift_seconds = time.perf_counter() - hift_started
+        if should_log_stage_timings():
+            print(
+                "CustomCosyVoice stage timing:",
+                {
+                    "llm_seconds": round(llm_seconds, 3),
+                    "flow_seconds": round(flow_seconds, 3),
+                    "hift_seconds": round(hift_seconds, 3),
+                    "token_count": int(tts_speech_token.size(1)),
+                    "mel_frames": int(tts_mel.shape[-1]),
+                    "flow_amp": self.flow_amp_dtype or "off",
+                    "hift_amp": self.hift_amp_dtype or "off",
+                    "hift_weight_norm_removed": self.hift_weight_norm_removed,
+                },
+            )
+        clear_device_cache(torch, self.device)
         return {'tts_speech': tts_speech}
      
 ###CosyVoice
@@ -227,6 +293,9 @@ class CustomCosyVoice:
     def list_avaliable_spks(self):
         spks = list(self.frontend.spk2info.keys())
         return spks
+
+    def build_zero_shot_prompt_cache(self, prompt_text, prompt_speech_16k):
+        return self.frontend.build_zero_shot_prompt_cache(prompt_text, prompt_speech_16k)
 
     def inference_sft(self, tts_text, spk_id):
         tts_speeches = []
@@ -271,6 +340,17 @@ class CustomCosyVoice:
                 continue
             print("Synthesizing:",i)
             model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k)
+            model_output = self.model.inference(**model_input)
+            tts_speeches.append(model_output['tts_speech'])
+        return {'tts_speech': torch.concat(tts_speeches, dim=1)}
+
+    def inference_zero_shot_no_normalize_cached_prompt(self, tts_text, prompt_cache):
+        tts_speeches = []
+        for i in re.split(r'(?<=[？！。.?!])\s*', tts_text):
+            if not len(i):
+                continue
+            print("Synthesizing:", i)
+            model_input = self.frontend.frontend_zero_shot_from_cache(i, prompt_cache)
             model_output = self.model.inference(**model_input)
             tts_speeches.append(model_output['tts_speech'])
         return {'tts_speech': torch.concat(tts_speeches, dim=1)}

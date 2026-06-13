@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+G2PWModel/
+results/
+tmp/
+
+.DS_Store

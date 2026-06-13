@@ -38,6 +38,13 @@ This code is modified from https://github.com/jik876/hifi-gan
  https://github.com/NVIDIA/BigVGAN
 
 """
+def _remove_weight_norm_if_present(module: nn.Module) -> None:
+    try:
+        remove_weight_norm(module)
+    except ValueError:
+        pass
+
+
 class ResBlock(torch.nn.Module):
     """Residual block module in HiFiGAN/BigVGAN."""
     def __init__(
@@ -97,8 +104,8 @@ class ResBlock(torch.nn.Module):
 
     def remove_weight_norm(self):
         for idx in range(len(self.convs1)):
-            remove_weight_norm(self.convs1[idx])
-            remove_weight_norm(self.convs2[idx])
+            _remove_weight_norm_if_present(self.convs1[idx])
+            _remove_weight_norm_if_present(self.convs2[idx])
 
 class SineGen(torch.nn.Module):
     """ Definition of sine generator
@@ -313,6 +320,7 @@ class HiFTGenerator(nn.Module):
         self.reflection_pad = nn.ReflectionPad1d((1, 0))
         self.stft_window = torch.from_numpy(get_window("hann", istft_params["n_fft"], fftbins=True).astype(np.float32))
         self.f0_predictor = f0_predictor
+        self._weight_norm_removed = False
 
     def _f02source(self, f0: torch.Tensor) -> torch.Tensor:
         f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
@@ -373,18 +381,24 @@ class HiFTGenerator(nn.Module):
         return x
 
     def remove_weight_norm(self):
+        if self._weight_norm_removed:
+            return
         print('Removing weight norm...')
         for l in self.ups:
-            remove_weight_norm(l)
+            _remove_weight_norm_if_present(l)
         for l in self.resblocks:
             l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-        self.source_module.remove_weight_norm()
+        _remove_weight_norm_if_present(self.conv_pre)
+        _remove_weight_norm_if_present(self.conv_post)
+        if hasattr(self.m_source, "remove_weight_norm"):
+            self.m_source.remove_weight_norm()
         for l in self.source_downs:
-            remove_weight_norm(l)
+            _remove_weight_norm_if_present(l)
         for l in self.source_resblocks:
             l.remove_weight_norm()
+        if hasattr(self.f0_predictor, "remove_weight_norm"):
+            self.f0_predictor.remove_weight_norm()
+        self._weight_norm_removed = True
 
     @torch.inference_mode()
     def inference(self, mel: torch.Tensor) -> torch.Tensor:

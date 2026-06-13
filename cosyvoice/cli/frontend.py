@@ -22,15 +22,29 @@ import torchaudio
 import os
 import re
 import inflect
+from cosyvoice.utils.runtime import (
+    build_ort_session_options,
+    configure_torch_runtime,
+    describe_ort_runtime,
+    describe_torch_runtime,
+    get_torch_device,
+    select_ort_providers,
+)
 try:
     import ttsfrd
-    use_ttsfrd = True
+    TTSFRD_IMPORT_OK = True
 except ImportError:
     print("failed to import ttsfrd, use WeTextProcessing instead")
+    ttsfrd = None
+    TTSFRD_IMPORT_OK = False
+from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph
+
+
+def _build_text_normalizers():
     from tn.chinese.normalizer import Normalizer as ZhNormalizer
     from tn.english.normalizer import Normalizer as EnNormalizer
-    use_ttsfrd = False
-from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph
+
+    return ZhNormalizer(remove_erhua=False, full_to_half=False), EnNormalizer()
 
 
 class CosyVoiceFrontEnd:
@@ -46,28 +60,63 @@ class CosyVoiceFrontEnd:
                  allowed_special: str = 'all'):
         self.tokenizer = get_tokenizer()
         self.feat_extractor = feat_extractor
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        option.intra_op_num_threads = 1
-        self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option, providers=["CUDAExecutionProvider"if torch.cuda.is_available() else "CPUExecutionProvider"])
+        configure_torch_runtime(torch)
+        self.device = get_torch_device(torch)
+        option = build_ort_session_options(onnxruntime)
+        self.campplus_providers = select_ort_providers(
+            onnxruntime,
+            preferred_device=torch.device("cpu"),
+        )
+        self.speech_tokenizer_providers = select_ort_providers(
+            onnxruntime,
+            preferred_device=self.device,
+        )
+        self.campplus_session = onnxruntime.InferenceSession(
+            campplus_model,
+            sess_options=option,
+            providers=self.campplus_providers,
+        )
+        self.speech_tokenizer_session = onnxruntime.InferenceSession(
+            speech_tokenizer_model,
+            sess_options=option,
+            providers=self.speech_tokenizer_providers,
+        )
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
         self.instruct = instruct
         self.allowed_special = allowed_special
         self.inflect_parser = inflect.engine()
-        self.use_ttsfrd = use_ttsfrd
+        use_ttsfrd_env = os.environ.get("BREEZYVOICE_USE_TTSFRD", "auto").strip().lower()
+        resource_dir = os.path.join(model_dir, "CosyVoice-ttsfrd", "resource")
+        resource_ready = os.path.isdir(resource_dir)
+        self.use_ttsfrd = TTSFRD_IMPORT_OK and resource_ready
+        if use_ttsfrd_env in ("0", "false", "no"):
+            self.use_ttsfrd = False
+        elif use_ttsfrd_env in ("1", "true", "yes"):
+            if not TTSFRD_IMPORT_OK:
+                raise RuntimeError("BREEZYVOICE_USE_TTSFRD requested but ttsfrd is not importable")
+            if not resource_ready:
+                raise RuntimeError(
+                    f"BREEZYVOICE_USE_TTSFRD requested but resource directory is missing: {resource_dir}"
+                )
+        print(
+            "BreezyVoice frontend runtime:",
+            {
+                "torch": describe_torch_runtime(torch, self.device),
+                "campplus_ort": describe_ort_runtime(onnxruntime, self.campplus_providers),
+                "speech_tokenizer_ort": describe_ort_runtime(onnxruntime, self.speech_tokenizer_providers),
+                "use_ttsfrd": self.use_ttsfrd,
+            },
+        )
         if self.use_ttsfrd:
             self.frd = ttsfrd.TtsFrontendEngine()
             ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-            assert self.frd.initialize('{}/CosyVoice-ttsfrd/resource'.format(model_dir)) is True, 'failed to initialize ttsfrd resource'
+            assert self.frd.initialize(resource_dir) is True, 'failed to initialize ttsfrd resource'
             self.frd.set_lang_type('pinyin')
             self.frd.enable_pinyin_mix(True)
             self.frd.set_breakmodel_index(1)
         else:
-            self.zh_tn_model = ZhNormalizer(remove_erhua=False, full_to_half=False)
-            self.en_tn_model = EnNormalizer()
+            self.zh_tn_model, self.en_tn_model = _build_text_normalizers()
 
     def _extract_text_token(self, text):
         text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
